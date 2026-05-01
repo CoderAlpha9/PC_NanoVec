@@ -1,0 +1,12 @@
+Model: demo_mlp
+
+Inputs:
+  - input: shape=(1, 8), dtype=float32
+Outputs:
+  - output: shape=(1, 4), dtype=float32
+
+Compiled graph:
+  - dense1_matmul_add_relu_fused: FusedMatMulAddRelu(input, W1, B1) -> h_relu
+  - dense2_matmul_add_fused: FusedMatMulAdd(h_relu, W2, B2) -> output
+
+Static scratch floats: 16
