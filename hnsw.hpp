@@ -6,22 +6,17 @@
 #include <random>
 #include <unordered_set>
 #include <immintrin.h>
-#include <stdexcept>
 #include <algorithm>
-#include <iostream>
 
 namespace hnsw {
 
-// ---------------------------------------------------------
-// SIMD AVX256 Cosine Distance (1 - Cosine Similarity)
-// ---------------------------------------------------------
 inline float cosine_distance_avx2(const float* a, const float* b, size_t dim) {
     __m256 sum_dot = _mm256_setzero_ps();
     __m256 sum_sq_a = _mm256_setzero_ps();
     __m256 sum_sq_b = _mm256_setzero_ps();
 
     size_t i = 0;
-    // Process 8 floats at a time
+    // unroll by 8 for avx
     for (; i + 8 <= dim; i += 8) {
         __m256 va = _mm256_loadu_ps(a + i);
         __m256 vb = _mm256_loadu_ps(b + i);
@@ -31,7 +26,6 @@ inline float cosine_distance_avx2(const float* a, const float* b, size_t dim) {
         sum_sq_b = _mm256_add_ps(sum_sq_b, _mm256_mul_ps(vb, vb));
     }
 
-    // Horizontal sum of the AVX registers
     alignas(32) float dot_arr[8];
     alignas(32) float sq_a_arr[8];
     alignas(32) float sq_b_arr[8];
@@ -47,35 +41,29 @@ inline float cosine_distance_avx2(const float* a, const float* b, size_t dim) {
         norm_b += sq_b_arr[j];
     }
 
-    // Tail processing for dimensions not a multiple of 8
+    // clean up remaining dimensions
     for (; i < dim; ++i) {
         dot += a[i] * b[i];
         norm_a += a[i] * a[i];
         norm_b += b[i] * b[i];
     }
 
-    if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f; // Handle zero vectors
+    if (norm_a == 0.0f || norm_b == 0.0f) return 1.0f;
 
     float similarity = dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
-    // Clamp to prevent floating point inaccuracies from causing issues
     similarity = std::max(-1.0f, std::min(1.0f, similarity)); 
     
     return 1.0f - similarity;
 }
 
-// ---------------------------------------------------------
-// HNSW Graph Data Structures
-// ---------------------------------------------------------
 using NodeId = int;
 
 struct Node {
     NodeId id;
     const float* data;
-    // neighbors[level][neighbor_index]
     std::vector<std::vector<NodeId>> neighbors; 
 };
 
-// Priority Queue comparators
 struct DistId {
     float dist;
     NodeId id;
@@ -107,13 +95,11 @@ private:
         return static_cast<int>(-std::log(r) * mult_);
     }
 
-    // Search layer: Returns 'ef' closest neighbors found at a specific level
     std::priority_queue<DistId, std::vector<DistId>, std::less<DistId>> 
     search_layer(const float* query, NodeId ep, int ef, int level) {
-        
         std::unordered_set<NodeId> visited;
-        std::priority_queue<DistId, std::vector<DistId>, std::greater<DistId>> candidates; // Min-heap
-        std::priority_queue<DistId, std::vector<DistId>, std::less<DistId>> top_results;   // Max-heap
+        std::priority_queue<DistId, std::vector<DistId>, std::greater<DistId>> candidates;
+        std::priority_queue<DistId, std::vector<DistId>, std::less<DistId>> top_results;
 
         float d = distance(query, nodes_[ep].data);
         candidates.push({d, ep});
@@ -125,7 +111,7 @@ private:
             candidates.pop();
 
             DistId f = top_results.top();
-            if (c.dist > f.dist) break; // Furthest candidate in top_results is closer than nearest unchecked
+            if (c.dist > f.dist) break;
 
             for (NodeId neighbor : nodes_[c.id].neighbors[level]) {
                 if (visited.find(neighbor) == visited.end()) {
@@ -147,7 +133,6 @@ private:
         return top_results;
     }
 
-    // Simple neighbor selection heuristic (closest nodes)
     std::vector<NodeId> select_neighbors(std::priority_queue<DistId, std::vector<DistId>, std::less<DistId>>& candidates, size_t m) {
         std::vector<NodeId> selected;
         while (!candidates.empty()) {
@@ -168,9 +153,6 @@ public:
         mult_ = 1.0f / std::log(1.0f * M_);
     }
 
-    // ---------------------------------------------------------
-    // HNSW Build (Insertion)
-    // ---------------------------------------------------------
     void add_point(const float* data, NodeId id) {
         int level = get_random_level();
         Node new_node{id, data, std::vector<std::vector<NodeId>>(level + 1)};
@@ -189,7 +171,7 @@ public:
         NodeId curr_ep = enter_point_;
         float min_dist = distance(data, nodes_[curr_ep].data);
 
-        // Phase 1: Search top layers to find the best entry point for the insertion level
+        // find best entry point by dropping down from the top level
         for (int l = max_level_; l > level; --l) {
             bool changed = true;
             while (changed) {
@@ -205,20 +187,17 @@ public:
             }
         }
 
-        // Phase 2: Insert into layers from 'level' down to 0
+        // build connections in target levels
         for (int l = std::min(level, max_level_); l >= 0; --l) {
             auto top_candidates = search_layer(data, curr_ep, ef_construction_, l);
             auto neighbors = select_neighbors(top_candidates, l == 0 ? M0_ : M_);
             
-            // Add bidirectional connections
             for (NodeId n : neighbors) {
                 nodes_[id].neighbors[l].push_back(n);
                 nodes_[n].neighbors[l].push_back(id);
                 
-                // Shrink connections of the neighbor if it exceeds max capacity
                 size_t max_conn = (l == 0 ? M0_ : M_);
                 if (nodes_[n].neighbors[l].size() > max_conn) {
-                    // Re-evaluate connections for the neighbor
                     std::priority_queue<DistId, std::vector<DistId>, std::less<DistId>> n_candidates;
                     for (NodeId nn : nodes_[n].neighbors[l]) {
                         n_candidates.push({distance(nodes_[n].data, nodes_[nn].data), nn});
@@ -226,8 +205,6 @@ public:
                     nodes_[n].neighbors[l] = select_neighbors(n_candidates, max_conn);
                 }
             }
-            
-            // Update EP for the next layer down
             curr_ep = top_candidates.top().id; 
         }
 
@@ -237,9 +214,6 @@ public:
         }
     }
 
-    // ---------------------------------------------------------
-    // HNSW Traversal (Search)
-    // ---------------------------------------------------------
     std::vector<std::pair<NodeId, float>> search_knn(const float* query, size_t k, size_t ef_search = 50) {
         if (enter_point_ == -1) return {};
 
@@ -247,7 +221,6 @@ public:
         NodeId curr_ep = enter_point_;
         float min_dist = distance(query, nodes_[curr_ep].data);
 
-        // Phase 1: Descend to layer 0
         for (int l = max_level_; l > 0; --l) {
             bool changed = true;
             while (changed) {
@@ -263,7 +236,6 @@ public:
             }
         }
 
-        // Phase 2: Search layer 0
         auto top_candidates = search_layer(query, curr_ep, ef_search, 0);
 
         std::vector<std::pair<NodeId, float>> results;
@@ -271,7 +243,7 @@ public:
             results.push_back({top_candidates.top().id, top_candidates.top().dist});
             top_candidates.pop();
         }
-        std::reverse(results.begin(), results.end()); // Smallest distance first
+        std::reverse(results.begin(), results.end()); 
 
         if (results.size() > k) {
             results.resize(k);
@@ -280,4 +252,4 @@ public:
     }
 };
 
-}
+} // namespace hnsw
